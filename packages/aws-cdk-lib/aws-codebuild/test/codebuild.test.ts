@@ -566,7 +566,7 @@ describe('default properties', () => {
         reportBuildStatus: false,
         webhookFilters: [
           codebuild.FilterGroup.inEventOf(codebuild.EventAction.PUSH).andTagIsNot('stable'),
-          codebuild.FilterGroup.inEventOf(codebuild.EventAction.PULL_REQUEST_REOPENED).andBaseBranchIs('main'),
+          codebuild.FilterGroup.inEventOf(codebuild.EventAction.PULL_REQUEST_CREATED, codebuild.EventAction.PULL_REQUEST_UPDATED).andBaseBranchIs('main'),
           codebuild.FilterGroup.inEventOf(codebuild.EventAction.RELEASED).andBaseBranchIs('main'),
           codebuild.FilterGroup.inEventOf(codebuild.EventAction.PRERELEASED).andBaseBranchIs('main'),
           codebuild.FilterGroup.inEventOf(codebuild.EventAction.WORKFLOW_JOB_QUEUED).andBaseBranchIs('main'),
@@ -596,7 +596,7 @@ describe('default properties', () => {
             { Type: 'HEAD_REF', Pattern: 'refs/tags/stable', ExcludeMatchedPattern: true },
           ],
           [
-            { Type: 'EVENT', Pattern: 'PULL_REQUEST_REOPENED' },
+            { Type: 'EVENT', Pattern: 'PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED' },
             { Type: 'BASE_REF', Pattern: 'refs/heads/main' },
           ],
           [
@@ -706,7 +706,7 @@ describe('default properties', () => {
         Webhook: true,
         FilterGroups: [
           [
-            { Type: 'EVENT', Pattern: 'PULL_REQUEST_CREATED, PULL_REQUEST_UPDATED, PULL_REQUEST_MERGED, PULL_REQUEST_CLOSED' },
+            { Type: 'EVENT', Pattern: 'PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_MERGED,PULL_REQUEST_CLOSED' },
             { Type: 'HEAD_REF', Pattern: 'refs/tags/v.*' },
           ],
           [

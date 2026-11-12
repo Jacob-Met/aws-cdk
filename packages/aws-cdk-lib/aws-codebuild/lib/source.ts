@@ -462,7 +462,7 @@ export class FilterGroup {
   public _toJson(): CfnProject.WebhookFilterProperty[] {
     const eventFilter: CfnProject.WebhookFilterProperty = {
       type: 'EVENT',
-      pattern: set2Array(this.actions).join(', '),
+      pattern: set2Array(this.actions).join(','),
     };
     return [eventFilter].concat(this.filters);
   }
