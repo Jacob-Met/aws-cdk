@@ -1,7 +1,8 @@
 import { testDeprecated } from '@aws-cdk/cdk-build-tools';
-import { Template } from '../../assertions';
+import { Match, Template } from '../../assertions';
+import { LogGroup } from '../../aws-logs';
 import { Duration, SecretValue, Stack, Token } from '../../core';
-import { PublicSubnet, Vpc, VpnConnection } from '../lib';
+import { PublicSubnet, Vpc, VpnConnection, VpnTunnelLogOutputFormat } from '../lib';
 
 describe('vpn', () => {
   test('can add a vpn connection to a vpc with a vpn gateway', () => {
@@ -110,6 +111,103 @@ describe('vpn', () => {
         {
           PreSharedKey: 'secretkey1234',
           TunnelInsideCidr: '169.254.10.0/30',
+          LogOptions: Match.absent(),
+        },
+      ],
+    });
+  });
+
+  test('configures both VPN tunnel negotiation phases', () => {
+    const stack = new Stack();
+    new Vpc(stack, 'VpcNetwork', {
+      vpnConnections: {
+        Connection: {
+          ip: '192.0.2.1',
+          tunnelOptions: [{
+            ikeVersions: ['ikev2'],
+            phase1EncryptionAlgorithms: ['AES256'],
+            phase2EncryptionAlgorithms: ['AES256'],
+            phase1IntegrityAlgorithms: ['SHA2-256'],
+            phase2IntegrityAlgorithms: ['SHA2-256'],
+            phase1DhGroupNumbers: [14, 19],
+            phase2DhGroupNumbers: [14, 19],
+            phase1Lifetime: Duration.hours(8),
+            phase2Lifetime: Duration.hours(1),
+            dpdTimeout: Duration.seconds(40),
+            dpdTimeoutAction: 'restart',
+            rekeyFuzzPercentage: 75,
+            rekeyMarginTime: Duration.minutes(5),
+            replayWindowSize: 128,
+            startupAction: 'start',
+            enableTunnelLifecycleControl: true,
+          }],
+        },
+      },
+    });
+
+    Template.fromStack(stack).hasResourceProperties('AWS::EC2::VPNConnection', {
+      VpnTunnelOptionsSpecifications: [{
+        IKEVersions: [{ Value: 'ikev2' }],
+        Phase1EncryptionAlgorithms: [{ Value: 'AES256' }],
+        Phase2EncryptionAlgorithms: [{ Value: 'AES256' }],
+        Phase1IntegrityAlgorithms: [{ Value: 'SHA2-256' }],
+        Phase2IntegrityAlgorithms: [{ Value: 'SHA2-256' }],
+        Phase1DHGroupNumbers: [{ Value: 14 }, { Value: 19 }],
+        Phase2DHGroupNumbers: [{ Value: 14 }, { Value: 19 }],
+        Phase1LifetimeSeconds: 28800,
+        Phase2LifetimeSeconds: 3600,
+        DPDTimeoutSeconds: 40,
+        DPDTimeoutAction: 'restart',
+        RekeyFuzzPercentage: 75,
+        RekeyMarginTimeSeconds: 300,
+        ReplayWindowSize: 128,
+        StartupAction: 'start',
+        EnableTunnelLifecycleControl: true,
+      }],
+    });
+  });
+
+  test('configures activity and BGP logs independently for each VPN tunnel', () => {
+    const stack = new Stack();
+    const tunnelOneLogs = new LogGroup(stack, 'TunnelOneLogs');
+    const bgpOneLogs = new LogGroup(stack, 'BgpOneLogs');
+    const tunnelTwoLogs = new LogGroup(stack, 'TunnelTwoLogs');
+    new Vpc(stack, 'VpcNetwork', {
+      vpnConnections: {
+        Connection: {
+          ip: '192.0.2.1',
+          tunnelOptions: [{
+            tunnelLogs: { logGroup: tunnelOneLogs },
+            bgpLogs: { logGroup: bgpOneLogs, outputFormat: VpnTunnelLogOutputFormat.TEXT },
+          }, {
+            tunnelLogs: { logGroup: tunnelTwoLogs, outputFormat: VpnTunnelLogOutputFormat.TEXT },
+          }],
+        },
+      },
+    });
+
+    Template.fromStack(stack).hasResourceProperties('AWS::EC2::VPNConnection', {
+      VpnTunnelOptionsSpecifications: [
+        {
+          LogOptions: {
+            CloudwatchLogOptions: {
+              LogEnabled: true,
+              LogGroupArn: { 'Fn::GetAtt': [Match.stringLikeRegexp('^TunnelOneLogs'), 'Arn'] },
+              LogOutputFormat: 'json',
+              BgpLogEnabled: true,
+              BgpLogGroupArn: { 'Fn::GetAtt': [Match.stringLikeRegexp('^BgpOneLogs'), 'Arn'] },
+              BgpLogOutputFormat: 'text',
+            },
+          },
+        },
+        {
+          LogOptions: {
+            CloudwatchLogOptions: {
+              LogEnabled: true,
+              LogGroupArn: { 'Fn::GetAtt': [Match.stringLikeRegexp('^TunnelTwoLogs'), 'Arn'] },
+              LogOutputFormat: 'text',
+            },
+          },
         },
       ],
     });
