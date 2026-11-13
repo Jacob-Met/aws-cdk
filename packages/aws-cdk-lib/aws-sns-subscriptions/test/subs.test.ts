@@ -1233,7 +1233,7 @@ test('importing SQS queue and specify this as subscription', () => {
   });
 });
 
-test.each(['Default', 'Resource'])('lambda subscription from a topic named %s does not collide with the function', (name) => {
+test.each(['Default', 'Resource'])('lambda subscription handles special topic id %s', (name) => {
   const specialTopic = new sns.Topic(stack, name);
   const func = new lambda.Function(stack, 'Function', {
     runtime: lambda.Runtime.NODEJS_LATEST,
@@ -1251,9 +1251,13 @@ test.each(['Default', 'Resource'])('lambda subscription from a topic named %s do
   });
 });
 
-test.each(['Default', 'Resource'])('lambda subscription from an imported function keeps topic id %s', (name) => {
+test.each(['Default', 'Resource'])('imported Lambda keeps subscription id %s', (name) => {
   const specialTopic = new sns.Topic(stack, name);
-  const imported = lambda.Function.fromFunctionArn(stack, 'Imported', 'arn:aws:lambda:us-east-1:123456789012:function:Target');
+  const imported = lambda.Function.fromFunctionArn(
+    stack,
+    'Imported',
+    'arn:aws:lambda:us-east-1:123456789012:function:Target',
+  );
 
   const subscription = specialTopic.addSubscription(new subs.LambdaSubscription(imported));
 
