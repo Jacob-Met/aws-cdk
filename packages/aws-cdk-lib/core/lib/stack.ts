@@ -1555,10 +1555,16 @@ export class Stack extends Construct implements ITaggable {
    * Returns the list of reasons on the dependency path, or undefined
    * if there is no dependency.
    */
-  private stackDependencyReasons(other: Stack): StackDependencyReason[] | undefined {
+  private stackDependencyReasons(other: Stack, visited = new Set<Stack>()): StackDependencyReason[] | undefined {
     if (this === other) { return []; }
+    if (visited.has(this)) { return undefined; }
+
+    // Multiple dependency paths can share the same ancestors. Each ancestor
+    // only needs to be searched once, otherwise wide layered graphs produce
+    // exponentially many visits even when there is no cycle.
+    visited.add(this);
     for (const dep of Object.values(this._stackDependencies)) {
-      const ret = dep.stack.stackDependencyReasons(other);
+      const ret = dep.stack.stackDependencyReasons(other, visited);
       if (ret !== undefined) {
         return [...dep.reasons, ...ret];
       }
