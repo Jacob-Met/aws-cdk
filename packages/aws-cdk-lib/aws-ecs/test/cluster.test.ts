@@ -953,7 +953,7 @@ describe('cluster', () => {
     });
   });
 
-  testDeprecated('configures userdata with powershell if windows machine image is specified', () => {
+  testDeprecated('configures Windows ECS task IAM roles in a single PowerShell agent initialization', () => {
     // GIVEN
     const stack = new cdk.Stack();
     acknowledgeTestValidationRules(stack);
@@ -997,7 +997,7 @@ describe('cluster', () => {
               {
                 Ref: 'EcsCluster97242B84',
               },
-              "'</powershell>",
+              "' -EnableTaskIAMRole</powershell>",
             ],
           ],
         },
@@ -1058,6 +1058,29 @@ describe('cluster', () => {
         }),
       });
     }).toThrow(/Amazon Linux does not support special hardware type/);
+  });
+
+  test('Windows Auto Scaling capacity providers enable task IAM roles in the ECS agent', () => {
+    const stack = new cdk.Stack();
+    acknowledgeTestValidationRules(stack);
+    const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
+    const cluster = new ecs.Cluster(stack, 'Cluster', { vpc });
+    const asg = new autoscaling.AutoScalingGroup(stack, 'WindowsASG', {
+      vpc,
+      instanceType: new ec2.InstanceType('m5.large'),
+      machineImage: ecs.EcsOptimizedImage.windows(ecs.WindowsOptimizedVersion.SERVER_2022),
+    });
+    const provider = new ecs.AsgCapacityProvider(stack, 'Provider', { autoScalingGroup: asg });
+
+    cluster.addAsgCapacityProvider(provider);
+
+    const launchConfigurations = Template.fromStack(stack).findResources('AWS::AutoScaling::LaunchConfiguration');
+    const launchConfiguration = Object.values(launchConfigurations)[0];
+    const userData = JSON.stringify(launchConfiguration.Properties.UserData);
+
+    expect(userData).toContain(' -EnableTaskIAMRole');
+    // Reinitializing the ECS agent to enable the flag can fail on Windows.
+    expect(userData.match(/Initialize-ECSAgent/g)).toHaveLength(1);
   });
 
   testDeprecated('allows specifying windows image', () => {
