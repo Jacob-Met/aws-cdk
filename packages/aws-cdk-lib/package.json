@@ -49,6 +49,9 @@
   "cdk-package": {
     "pre": [
       "/bin/bash ./scripts/minify-sources.sh"
+    ],
+    "post": [
+      "python3 scripts/normalize-python-schema-packages.py"
     ]
   },
   "pkglint": {
