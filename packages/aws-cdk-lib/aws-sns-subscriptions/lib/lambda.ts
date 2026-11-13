@@ -43,7 +43,11 @@ export class LambdaSubscription implements sns.ITopicSubscription {
 
     return {
       subscriberScope: this.fn,
-      subscriberId: topic.node.id,
+      // "Default" is elided from CloudFormation logical IDs and "Resource"
+      // is the Lambda L1 child ID. Both can collide with the function.
+      subscriberId: topic.node.id === 'Default' || topic.node.id === 'Resource'
+        ? `Subscription-${Names.nodeUniqueId(topic.node)}`
+        : topic.node.id,
       endpoint: this.fn.functionArn,
       protocol: sns.SubscriptionProtocol.LAMBDA,
       filterPolicy: this.props.filterPolicy,
