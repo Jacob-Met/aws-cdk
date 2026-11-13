@@ -1289,6 +1289,55 @@ describe('stack', () => {
     expect(customResources2).toHaveLength(0);
   });
 
+  test('cross-region strong STRING_LIST references serialize to SSM strings and reconstruct lists', () => {
+    const app = makeCrossStackApp({ [cxapi.DEFAULT_CROSS_STACK_REFERENCES]: 'strong' });
+    const producer = new Stack(app, 'Producer', { env: { region: 'us-east-1' }, crossRegionReferences: true });
+    const exportResource = new CfnResource(producer, 'SomeResourceExport', { type: 'AWS::S3::Bucket' });
+    const consumer = new Stack(app, 'Consumer', { env: { region: 'us-west-2' }, crossRegionReferences: true });
+
+    new CfnResource(consumer, 'SomeResource', {
+      type: 'AWS::S3::Bucket',
+      properties: {
+        Name: exportResource.getAtt('DnsEntries', ResolutionTypeHint.STRING_LIST),
+      },
+    });
+
+    const assembly = app.synth();
+    const producerTemplate = assembly.getStackByName(producer.stackName).template;
+    const consumerTemplate = assembly.getStackByName(consumer.stackName).template;
+
+    const writer = Object.values(producerTemplate.Resources).find(
+      (r: any) => r.Type === 'Custom::CrossRegionExportWriter',
+    ) as any;
+    // SSM PutParameter.Value must be a string, never the raw Fn::GetAtt list.
+    expect(Object.values(writer.Properties.WriterProps.exports)).toEqual([{
+      'Fn::Join': ['||', { 'Fn::GetAtt': ['SomeResourceExport', 'DnsEntries'] }],
+    }]);
+
+    expect(consumerTemplate.Resources.SomeResource.Properties.Name).toEqual({
+      'Fn::Split': ['||', { 'Fn::GetAtt': [expect.stringContaining('ExportsReader'), expect.any(String)] }],
+    });
+  });
+
+  test('nested cross-region strong STRING_LIST references keep their list type', () => {
+    const app = makeCrossStackApp({ [cxapi.DEFAULT_CROSS_STACK_REFERENCES]: 'strong' });
+    const producer = new Stack(app, 'Producer', { env: { region: 'us-east-1' }, crossRegionReferences: true });
+    const source = new CfnResource(producer, 'Source', { type: 'AWS::S3::Bucket' });
+    const consumer = new Stack(app, 'Consumer', { env: { region: 'us-west-2' }, crossRegionReferences: true });
+    const nestedConsumer = new NestedStack(consumer, 'Nested');
+
+    new CfnResource(nestedConsumer, 'ListConsumer', {
+      type: 'AWS::S3::Bucket',
+      properties: { Name: source.getAtt('DnsEntries', ResolutionTypeHint.STRING_LIST) },
+    });
+
+    const assembly = app.synth();
+    const nestedTemplate = JSON.parse(fs.readFileSync(assembly.directory + '/' + nestedConsumer.templateFile, 'utf8'));
+    expect(nestedTemplate.Resources.ListConsumer.Properties.Name).toEqual({
+      'Fn::Split': ['||', { Ref: expect.any(String) }],
+    });
+  });
+
   test('cross-region weak references serialize STRING_LIST with Fn::Join and deserialize with Fn::Split', () => {
     // GIVEN
     const app = makeCrossStackApp({ [cxapi.DEFAULT_CROSS_STACK_REFERENCES]: 'weak' });

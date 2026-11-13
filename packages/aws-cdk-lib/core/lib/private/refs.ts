@@ -16,6 +16,7 @@ import { Fn } from '../cfn-fn';
 import { CfnOutput } from '../cfn-output';
 import { CfnParameter } from '../cfn-parameter';
 import { ExportWriter } from '../custom-resource-provider/cross-region-export-providers/export-writer-provider';
+import { STRING_LIST_REFERENCE_DELIMITER } from '../custom-resource-provider/cross-region-export-providers/types';
 import { AssumptionError, UnscopedValidationError } from '../errors';
 import { Lazy } from '../lazy';
 import { Names } from '../names';
@@ -34,7 +35,7 @@ import type {
 import { ReferenceStrength } from '../cross-stack-reference-strength';
 import { stackOf } from './core-construct-finders';
 
-export const STRING_LIST_REFERENCE_DELIMITER = '||';
+export { STRING_LIST_REFERENCE_DELIMITER } from '../custom-resource-provider/cross-region-export-providers/types';
 
 function crossStackReferenceStrength(scope: IConstruct): ReferenceStrength | undefined {
   const value = scope.node.tryGetContext(cxapi.DEFAULT_CROSS_STACK_REFERENCES);
@@ -411,10 +412,16 @@ function createCrossRegionImportValue(reference: Reference, importStack: Stack):
   const { exportWriter, exportName } = getOrCreateExportWriter(reference, importStack);
 
   const exported = exportWriter.exportValue(exportName, reference, importStack);
-  if (importStack.nestedStackParent) {
-    return createNestedStackParameter(importStack, (exported as CfnReference), exported);
+  const imported = importStack.nestedStackParent
+    ? createNestedStackParameter(importStack, (exported as CfnReference), exported)
+    : exported;
+
+  // The SSM parameter (and the ExportReader) transport only strings.
+  // Reconstitute a CloudFormation list in the consuming stack.
+  if (reference.typeHint === ResolutionTypeHint.STRING_LIST) {
+    return Tokenization.reverseList(Fn.split(STRING_LIST_REFERENCE_DELIMITER, Token.asString(imported))) as Intrinsic;
   }
-  return exported;
+  return imported;
 }
 
 /**
