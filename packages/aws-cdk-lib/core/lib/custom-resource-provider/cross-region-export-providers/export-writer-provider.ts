@@ -1,8 +1,9 @@
 import { Construct } from 'constructs';
 import { ExportReader } from './export-reader-provider';
 import type { ExportWriterCRProps } from './types';
-import { SSM_EXPORT_PATH_PREFIX } from './types';
+import { SSM_EXPORT_PATH_PREFIX, STRING_LIST_REFERENCE_DELIMITER } from './types';
 import { CfnDynamicReference, CfnDynamicReferenceService } from '../../cfn-dynamic-reference';
+import { Fn } from '../../cfn-fn';
 import { CustomResource } from '../../custom-resource';
 import { CrossRegionSsmWriterProvider } from '../../dist/core/cross-region-ssm-writer-provider.generated';
 import type { IMapBox, ISetBox } from '../../helpers-internal';
@@ -13,6 +14,7 @@ import { makeUniqueId } from '../../private/uniqueid';
 import type { Reference } from '../../reference';
 import type { Stack } from '../../stack';
 import { Token } from '../../token';
+import { ResolutionTypeHint } from '../../type-hints';
 import type { CustomResourceProviderOptions } from '../shared';
 
 /**
@@ -148,7 +150,12 @@ export class ExportWriter extends Construct {
   private registerExport(exportName: string, reference: Reference, importStack: Stack): string {
     const stack = stackOf(this);
     const parameterName = `/${SSM_EXPORT_PATH_PREFIX}${exportName}`;
-    this._references.put(parameterName, stack.resolve(reference.toString()));
+    // SSM PutParameter accepts strings, not CloudFormation list attributes.
+    // Mirror the Fn::Join/Fn::Split encoding used for other stack references.
+    const value = reference.typeHint === ResolutionTypeHint.STRING_LIST
+      ? Fn.join(STRING_LIST_REFERENCE_DELIMITER, Token.asList(reference))
+      : reference.toString();
+    this._references.put(parameterName, stack.resolve(value));
     this.addRegionToPolicy(importStack.region);
     return parameterName;
   }

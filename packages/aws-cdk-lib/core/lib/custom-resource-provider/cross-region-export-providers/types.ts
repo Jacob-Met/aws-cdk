@@ -8,6 +8,9 @@ import type { IResolvable } from '../../resolvable';
  */
 export const SSM_EXPORT_PATH_PREFIX = 'cdk/exports/';
 
+/** Delimiter for transporting CloudFormation string lists as SSM parameter values. */
+export const STRING_LIST_REFERENCE_DELIMITER = '||';
+
 /**
  * Map of exportName to export value
  */
