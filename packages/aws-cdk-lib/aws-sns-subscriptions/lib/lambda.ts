@@ -41,13 +41,15 @@ export class LambdaSubscription implements sns.ITopicSubscription {
       this.fn.stack.addStackDependency(topic.stack);
     }
 
+    // Native Lambda functions already have a Resource child. A subscription
+    // named Resource or Default would collide with it, since Default is elided
+    // from CloudFormation logical IDs. Imported functions need no such change.
+    const hasResourceChild = this.fn.node.tryFindChild('Resource') !== undefined;
+    const needsDistinctId = hasResourceChild && (topic.node.id === 'Default' || topic.node.id === 'Resource');
+
     return {
       subscriberScope: this.fn,
-      // "Default" is elided from CloudFormation logical IDs and "Resource"
-      // is the Lambda L1 child ID. Both can collide with the function.
-      subscriberId: topic.node.id === 'Default' || topic.node.id === 'Resource'
-        ? `Subscription-${Names.nodeUniqueId(topic.node)}`
-        : topic.node.id,
+      subscriberId: needsDistinctId ? `Subscription-${Names.nodeUniqueId(topic.node)}` : topic.node.id,
       endpoint: this.fn.functionArn,
       protocol: sns.SubscriptionProtocol.LAMBDA,
       filterPolicy: this.props.filterPolicy,
