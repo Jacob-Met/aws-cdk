@@ -1935,6 +1935,29 @@ describe('stack', () => {
     expect(() => child1.addStackDependency(child2)).toThrow("'Parent/Child2' depends on");
   });
 
+  test('addStackDependency handles many converging dependency paths', () => {
+    const app = new App();
+    const firstWave: Stack[] = [];
+    let previousWave: Stack[] = [];
+
+    for (let waveNumber = 0; waveNumber < 9; waveNumber++) {
+      const wave = Array.from({ length: 10 }, (_, index) =>
+        new Stack(app, `Wave${waveNumber}Stack${index}`));
+      if (waveNumber === 0) {
+        firstWave.push(...wave);
+      }
+      for (const stack of wave) {
+        for (const predecessor of previousWave) {
+          stack.addStackDependency(predecessor);
+        }
+      }
+      previousWave = wave;
+    }
+
+    expect(previousWave[0].dependencies).toHaveLength(10);
+    expect(() => firstWave[9].addStackDependency(previousWave[0])).toThrow('would create a cyclic reference');
+  });
+
   test('addStackDependency handles duplicate dependency reasons', () => {
     const app = makeCrossStackApp({ '@aws-cdk/core:stackRelativeExports': true, [cxapi.NEW_STYLE_STACK_SYNTHESIS_CONTEXT]: false });
     const parent = new Stack(app, 'Parent');
