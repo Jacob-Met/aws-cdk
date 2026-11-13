@@ -1233,6 +1233,24 @@ test('importing SQS queue and specify this as subscription', () => {
   });
 });
 
+test.each(['Default', 'Resource'])('lambda subscription from a topic named %s does not collide with the function', (name) => {
+  const specialTopic = new sns.Topic(stack, name);
+  const func = new lambda.Function(stack, 'Function', {
+    runtime: lambda.Runtime.NODEJS_LATEST,
+    handler: 'index.handler',
+    code: lambda.Code.fromInline('exports.handler = async () => {}'),
+  });
+
+  specialTopic.addSubscription(new subs.LambdaSubscription(func));
+
+  const template = Template.fromStack(stack);
+  template.resourceCountIs('AWS::Lambda::Function', 1);
+  template.resourceCountIs('AWS::SNS::Subscription', 1);
+  template.hasResourceProperties('AWS::SNS::Subscription', {
+    Protocol: 'lambda',
+  });
+});
+
 test('lambda subscription', () => {
   const func = new lambda.Function(stack, 'MyFunc', {
     runtime: lambda.Runtime.NODEJS_LATEST,
