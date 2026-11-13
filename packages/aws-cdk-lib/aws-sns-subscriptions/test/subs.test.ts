@@ -1251,6 +1251,16 @@ test.each(['Default', 'Resource'])('lambda subscription from a topic named %s do
   });
 });
 
+test.each(['Default', 'Resource'])('lambda subscription from an imported function keeps topic id %s', (name) => {
+  const specialTopic = new sns.Topic(stack, name);
+  const imported = lambda.Function.fromFunctionArn(stack, 'Imported', 'arn:aws:lambda:us-east-1:123456789012:function:Target');
+
+  const subscription = specialTopic.addSubscription(new subs.LambdaSubscription(imported));
+
+  expect(subscription.node.id).toBe(name);
+  Template.fromStack(stack).resourceCountIs('AWS::SNS::Subscription', 1);
+});
+
 test('lambda subscription', () => {
   const func = new lambda.Function(stack, 'MyFunc', {
     runtime: lambda.Runtime.NODEJS_LATEST,
