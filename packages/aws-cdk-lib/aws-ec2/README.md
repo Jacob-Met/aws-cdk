@@ -1123,6 +1123,34 @@ const vpc = new ec2.Vpc(this, 'MyVpc', {
 });
 ```
 
+Tunnel options can configure IKE/IPsec negotiation and publish tunnel activity and BGP logs to
+CloudWatch Logs independently. Logging is off unless configured for each tunnel. For example:
+
+```ts fixture=with-vpc
+import { Duration } from 'aws-cdk-lib';
+import * as logs from 'aws-cdk-lib/aws-logs';
+
+const tunnelLogs = new logs.LogGroup(vpc, 'TunnelLogs');
+const bgpLogs = new logs.LogGroup(vpc, 'BgpLogs');
+vpc.addVpnConnection('Monitored', {
+  ip: '203.0.113.12',
+  tunnelOptions: [{
+    ikeVersions: ['ikev2'],
+    phase1EncryptionAlgorithms: ['AES256'],
+    phase2EncryptionAlgorithms: ['AES256'],
+    phase1DhGroupNumbers: [14],
+    phase2DhGroupNumbers: [14],
+    phase1Lifetime: Duration.hours(8),
+    phase2Lifetime: Duration.hours(1),
+    tunnelLogs: { logGroup: tunnelLogs },
+    bgpLogs: {
+      logGroup: bgpLogs,
+      outputFormat: ec2.VpnTunnelLogOutputFormat.TEXT,
+    },
+  }],
+});
+```
+
 To create a VPC that can accept VPN connections, set `vpnGateway` to `true`:
 
 ```ts

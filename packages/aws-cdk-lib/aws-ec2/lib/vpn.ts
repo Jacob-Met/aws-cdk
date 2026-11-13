@@ -12,7 +12,8 @@ import {
 } from './ec2.generated';
 import type { IVpc, SubnetSelection } from './vpc';
 import * as cloudwatch from '../../aws-cloudwatch';
-import type { IResource, SecretValue } from '../../core';
+import type { ILogGroupRef } from '../../aws-logs';
+import type { Duration, IResource, SecretValue } from '../../core';
 import { Resource, Token, ValidationError } from '../../core';
 import { addConstructMetadata } from '../../core/lib/metadata-resource';
 import { lit } from '../../core/lib/private/literal-string';
@@ -52,6 +53,33 @@ export interface IVpnGateway extends IResource, IVPNGatewayRef {
   readonly gatewayId: string;
 }
 
+/**
+ * CloudWatch logging for a site-to-site VPN tunnel.
+ */
+export interface VpnTunnelLogOptions {
+  /**
+   * The log group receiving the tunnel activity or BGP events.
+   */
+  readonly logGroup: ILogGroupRef;
+
+  /**
+   * How log events are formatted.
+   *
+   * @default VpnTunnelLogOutputFormat.JSON
+   */
+  readonly outputFormat?: VpnTunnelLogOutputFormat;
+}
+
+/**
+ * Log formats supported for VPN tunnel activity and BGP logs.
+ */
+export enum VpnTunnelLogOutputFormat {
+  /** JSON-formatted events. */
+  JSON = 'json',
+  /** Plain-text events. */
+  TEXT = 'text',
+}
+
 export interface VpnTunnelOption {
   /**
    * The pre-shared key (PSK) to establish initial authentication between the
@@ -82,6 +110,133 @@ export interface VpnTunnelOption {
    * @default an Amazon generated inside IP CIDR
    */
   readonly tunnelInsideCidr?: string;
+
+  /**
+   * Send tunnel activity logs to this CloudWatch log group.
+   *
+   * @default - tunnel activity logging is disabled
+   */
+  readonly tunnelLogs?: VpnTunnelLogOptions;
+
+  /**
+   * Send BGP logs to this CloudWatch log group.
+   *
+   * @default - BGP logging is disabled
+   */
+  readonly bgpLogs?: VpnTunnelLogOptions;
+
+  /**
+   * Permitted IKE versions, such as ikev2.
+   *
+   * @default - AWS selects supported IKE versions
+   */
+  readonly ikeVersions?: string[];
+
+  /**
+   * Allowed Phase 1 encryption algorithms.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase1EncryptionAlgorithms?: string[];
+
+  /**
+   * Allowed Phase 2 encryption algorithms.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase2EncryptionAlgorithms?: string[];
+
+  /**
+   * Allowed Phase 1 integrity algorithms.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase1IntegrityAlgorithms?: string[];
+
+  /**
+   * Allowed Phase 2 integrity algorithms.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase2IntegrityAlgorithms?: string[];
+
+  /**
+   * Allowed Phase 1 Diffie-Hellman groups.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase1DhGroupNumbers?: number[];
+
+  /**
+   * Allowed Phase 2 Diffie-Hellman groups.
+   *
+   * @default - AWS defaults
+   */
+  readonly phase2DhGroupNumbers?: number[];
+
+  /**
+   * Lifetime of a Phase 1 security association.
+   *
+   * @default - AWS default lifetime
+   */
+  readonly phase1Lifetime?: Duration;
+
+  /**
+   * Lifetime of a Phase 2 security association.
+   *
+   * @default - AWS default lifetime
+   */
+  readonly phase2Lifetime?: Duration;
+
+  /**
+   * Dead-peer-detection timeout.
+   *
+   * @default - AWS default timeout
+   */
+  readonly dpdTimeout?: Duration;
+
+  /**
+   * Action when the dead-peer-detection timeout elapses.
+   *
+   * @default - AWS default action
+   */
+  readonly dpdTimeoutAction?: string;
+
+  /**
+   * Maximum percentage of rekey-window jitter.
+   *
+   * @default - AWS default percentage
+   */
+  readonly rekeyFuzzPercentage?: number;
+
+  /**
+   * Time before Phase 2 expiry when rekeying starts.
+   *
+   * @default - AWS default rekey margin
+   */
+  readonly rekeyMarginTime?: Duration;
+
+  /**
+   * Number of packets in the replay detection window.
+   *
+   * @default - AWS default window
+   */
+  readonly replayWindowSize?: number;
+
+  /**
+   * Action the VPN endpoint takes when the tunnel starts.
+   *
+   * @default - AWS default startup action
+   */
+  readonly startupAction?: string;
+
+  /**
+   * Allow control of tunnel endpoint lifecycle.
+   *
+   * @default false
+   */
+  readonly enableTunnelLifecycleControl?: boolean;
+
 }
 
 export interface VpnConnectionOptions {
@@ -374,6 +529,32 @@ export class VpnConnection extends VpnConnectionBase {
       vpnTunnelOptionsSpecifications: props.tunnelOptions?.map(t => ({
         preSharedKey: t.preSharedKeySecret?.unsafeUnwrap() ?? t.preSharedKey,
         tunnelInsideCidr: t.tunnelInsideCidr,
+        ikeVersions: t.ikeVersions?.map(value => ({ value })),
+        phase1EncryptionAlgorithms: t.phase1EncryptionAlgorithms?.map(value => ({ value })),
+        phase2EncryptionAlgorithms: t.phase2EncryptionAlgorithms?.map(value => ({ value })),
+        phase1IntegrityAlgorithms: t.phase1IntegrityAlgorithms?.map(value => ({ value })),
+        phase2IntegrityAlgorithms: t.phase2IntegrityAlgorithms?.map(value => ({ value })),
+        phase1DhGroupNumbers: t.phase1DhGroupNumbers?.map(value => ({ value })),
+        phase2DhGroupNumbers: t.phase2DhGroupNumbers?.map(value => ({ value })),
+        phase1LifetimeSeconds: t.phase1Lifetime?.toSeconds(),
+        phase2LifetimeSeconds: t.phase2Lifetime?.toSeconds(),
+        dpdTimeoutSeconds: t.dpdTimeout?.toSeconds(),
+        dpdTimeoutAction: t.dpdTimeoutAction,
+        rekeyFuzzPercentage: t.rekeyFuzzPercentage,
+        rekeyMarginTimeSeconds: t.rekeyMarginTime?.toSeconds(),
+        replayWindowSize: t.replayWindowSize,
+        startupAction: t.startupAction,
+        enableTunnelLifecycleControl: t.enableTunnelLifecycleControl,
+        logOptions: t.tunnelLogs || t.bgpLogs ? {
+          cloudwatchLogOptions: {
+            logEnabled: t.tunnelLogs ? true : undefined,
+            logGroupArn: t.tunnelLogs?.logGroup.logGroupRef.logGroupArn,
+            logOutputFormat: t.tunnelLogs?.outputFormat ?? (t.tunnelLogs ? VpnTunnelLogOutputFormat.JSON : undefined),
+            bgpLogEnabled: t.bgpLogs ? true : undefined,
+            bgpLogGroupArn: t.bgpLogs?.logGroup.logGroupRef.logGroupArn,
+            bgpLogOutputFormat: t.bgpLogs?.outputFormat ?? (t.bgpLogs ? VpnTunnelLogOutputFormat.JSON : undefined),
+          },
+        } : undefined,
       })),
     });
 
