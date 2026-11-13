@@ -68,6 +68,15 @@ describe('DynamoAttributeValue', () => {
     });
   });
 
+  test('from number at a JSONPath converts the runtime number into a DynamoDB string', () => {
+    const attribute = tasks.DynamoAttributeValue.fromNumber(sfn.JsonPath.numberAt('$.viewCount'));
+    expect(sfn.FieldUtils.renderObject(attribute)).toEqual({
+      attributeValue: {
+        'N.$': "States.Format('{}', $.viewCount)",
+      },
+    });
+  });
+
   test('number from string', () => {
     // GIVEN
     const n = '9';

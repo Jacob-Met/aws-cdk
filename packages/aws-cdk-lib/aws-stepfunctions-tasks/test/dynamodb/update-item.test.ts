@@ -66,6 +66,25 @@ test('UpdateItem task', () => {
   });
 });
 
+test('UpdateItem accepts a numeric JSONPath for a DynamoDB number', () => {
+  const task = new tasks.DynamoUpdateItem(stack, 'UpdateNumber', {
+    table,
+    key: { id: tasks.DynamoAttributeValue.fromString(sfn.JsonPath.stringAt('$.id')) },
+    updateExpression: 'SET viewCount = :viewCount',
+    expressionAttributeValues: {
+      ':viewCount': tasks.DynamoAttributeValue.fromNumber(sfn.JsonPath.numberAt('$.viewCount')),
+    },
+  });
+
+  expect(stack.resolve(task.toStateJson())).toMatchObject({
+    Parameters: {
+      ExpressionAttributeValues: {
+        ':viewCount': { 'N.$': "States.Format('{}', $.viewCount)" },
+      },
+    },
+  });
+});
+
 test('UpdateItem task - using JSONata', () => {
   // WHEN
   const task = tasks.DynamoUpdateItem.jsonata(stack, 'UpdateItem', {

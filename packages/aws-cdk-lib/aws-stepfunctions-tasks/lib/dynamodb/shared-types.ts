@@ -1,4 +1,6 @@
 import { transformAttributeValueMap, validateJsonata, validateJsonPath } from './private/utils';
+import { JsonPath } from '../../../aws-stepfunctions';
+import { jsonPathFromAny } from '../../../aws-stepfunctions/lib/private/json-path';
 import { UnscopedValidationError } from '../../../core';
 import { lit } from '../../../core/lib/private/literal-string';
 
@@ -138,6 +140,12 @@ export class DynamoAttributeValue {
    * However, DynamoDB treats them as number type attributes for mathematical operations.
    */
   public static fromNumber(value: number) {
+    const path = jsonPathFromAny(value);
+    if (path !== undefined) {
+      // Step Functions requires DynamoDB's N value to be a string, even when
+      // the input at this JSONPath is a number.
+      return new DynamoAttributeValue({ N: JsonPath.format('{}', JsonPath.stringAt(path)) });
+    }
     return new DynamoAttributeValue({ N: value.toString() });
   }
 
