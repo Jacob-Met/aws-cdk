@@ -1,7 +1,7 @@
 import * as logs from './logs.generated';
 import { logGroupArnWithoutStreamSuffix } from './private/log-group-arn';
 import * as iam from '../../aws-iam';
-import type * as cdk from '../../core/lib';
+import * as cdk from '../../core/lib';
 
 /**
  * Properties for LogGroupGrants
@@ -50,7 +50,7 @@ export class LogGroupGrants {
     // Include both the log group ARN and the log stream ARN (':*') by default.
     const resourceArns = options.resourceArns ?? [
       logGroupArnWithoutStreamSuffix(this.resource),
-      logs.CfnLogGroup.arnForLogGroup(this.resource),
+      this.logStreamArnFor(grantee),
     ];
     return this.policyResource
       ? iam.Grant.addToPrincipalOrResource({
@@ -72,7 +72,27 @@ export class LogGroupGrants {
   public write(grantee: iam.IGrantable): iam.Grant {
     const actions = ['logs:CreateLogStream', 'logs:PutLogEvents'];
     // Both actions apply to log streams, which only the log stream ARN (':*') matches.
-    return this.actions(grantee, actions, { resourceArns: [logs.CfnLogGroup.arnForLogGroup(this.resource)] });
+    return this.actions(grantee, actions, { resourceArns: [this.logStreamArnFor(grantee)] });
+  }
+
+  /**
+   * Cross-environment log group ARN references lose their stream suffix.
+   * Rebuild the stream ARN from the group's name for a different account or region.
+   */
+  private logStreamArnFor(grantee: iam.IGrantable): string {
+    const logGroupArn = logs.CfnLogGroup.arnForLogGroup(this.resource);
+    // Imported ARNs can already contain the suffix, even if the ARN is unresolved.
+    if (logGroupArn.endsWith(':*')) {
+      return logGroupArn;
+    }
+    const principal = grantee.grantPrincipal;
+    if (iam.principalIsOwnedResource(principal)) {
+      const principalStack = cdk.Stack.of(principal);
+      if (principalStack.account !== this.resource.env.account || principalStack.region !== this.resource.env.region) {
+        return logGroupArnWithoutStreamSuffix(this.resource) + ':*';
+      }
+    }
+    return logGroupArn;
   }
 
   /**
