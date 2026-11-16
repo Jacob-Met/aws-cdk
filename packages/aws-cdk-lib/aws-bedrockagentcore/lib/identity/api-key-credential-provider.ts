@@ -156,6 +156,11 @@ export interface ApiKeyCredentialProviderProps {
 export interface ApiKeyCredentialProviderFromSecretProps {
   /**
    * Existing Secrets Manager secret containing the API key as a JSON field.
+   *
+   * The L2 interface preserves the complete ARN of imported secrets, rather than
+   * rebuilding it from a possibly qualified SecretId.
+   *
+   * [disable-awslint:prefer-ref-interface]
    */
   readonly secret: secretsmanager.ISecret;
 
