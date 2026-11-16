@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { PolicyValidationReportJson } from '@aws-cdk/cloud-assembly-schema';
 import { Construct } from 'constructs';
+import * as cxschema from '../../../cloud-assembly-schema';
 import * as cxapi from '../../../cx-api';
 import * as core from '../../lib';
 import type { IPolicyValidationContext } from '../../lib';
@@ -160,6 +161,70 @@ describe('CloudFormationValidatePlugin', () => {
     const output = consoleErrorMock.mock.calls.map((c: any[]) => c[0]).join('\n');
     expect(output).toContain('Template validation found issues in your templates');
     expect(output).toContain(cxapi.VALIDATE_AGAINST_DEFAULT_RULES);
+  });
+
+  test('skips built-in validation until missing context is resolved', () => {
+    const app = new core.App({
+      context: {
+        [cxapi.VALIDATE_AGAINST_DEFAULT_RULES]: true,
+        [cxapi.FAIL_SYNTH_ON_VALIDATION_ERRORS_CONTEXT]: true,
+      },
+    });
+    const stack = new core.Stack(app, 'TestStack', {
+      env: { account: '111111111111', region: 'us-east-1' },
+    });
+    core.ContextProvider.getValue(stack, {
+      provider: cxschema.ContextProvider.SSM_PARAMETER_PROVIDER,
+      props: { parameterName: '/missing/test-parameter' },
+      dummyValue: 'dummy-value',
+    });
+    new core.CfnResource(stack, 'InvalidBucket', {
+      type: 'AWS::S3::Bucket',
+      properties: { BogusProperty: 'invalid-value' },
+    });
+
+    const assembly = app.synth();
+
+    expect(assembly.manifest.missing).toHaveLength(1);
+    expect(process.exitCode).toBeUndefined();
+    const output = consoleErrorMock.mock.calls.map((c: any[]) => c[0]).join('\n');
+    expect(output).not.toContain('BogusProperty');
+    expect(output).not.toContain('CloudFormation Validate');
+  });
+
+  test('explicit CloudFormation validation still runs with missing context', () => {
+    const app = new core.App({
+      context: {
+        [cxapi.VALIDATE_AGAINST_DEFAULT_RULES]: true,
+        [cxapi.FAIL_SYNTH_ON_VALIDATION_ERRORS_CONTEXT]: false,
+      },
+    });
+    core.Validations.of(app).addPlugins(newPlugin());
+    const stack = new core.Stack(app, 'TestStack', {
+      env: { account: '111111111111', region: 'us-east-1' },
+    });
+    core.ContextProvider.getValue(stack, {
+      provider: cxschema.ContextProvider.SSM_PARAMETER_PROVIDER,
+      props: { parameterName: '/missing/test-parameter' },
+      dummyValue: 'dummy-value',
+    });
+    new core.CfnResource(stack, 'InvalidBucket', {
+      type: 'AWS::S3::Bucket',
+      properties: { BogusProperty: 'invalid-value' },
+    });
+
+    const assembly = app.synth();
+    const report = loadValidationReport(assembly);
+
+    expect(assembly.manifest.missing).toHaveLength(1);
+    expect(report.pluginReports).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        pluginName: 'CloudFormation Validate',
+        violations: expect.arrayContaining([
+          expect.objectContaining({ ruleName: 'F3002' }),
+        ]),
+      }),
+    ]));
   });
 
   test('template paths are assembly-relative, also for nested assemblies', () => {
