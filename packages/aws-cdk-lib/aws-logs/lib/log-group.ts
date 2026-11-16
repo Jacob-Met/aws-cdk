@@ -679,7 +679,7 @@ export class LogGroup extends LogGroupBase {
     return this.getResourceArnAttribute(this.resource.attrArn, {
       service: 'logs',
       resource: 'log-group',
-      resourceName: this.physicalName,
+      resourceName: `${this.physicalName}:*`,
       arnFormat: ArnFormat.COLON_RESOURCE_NAME,
     });
   }

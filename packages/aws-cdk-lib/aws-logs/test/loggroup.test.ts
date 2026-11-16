@@ -488,6 +488,49 @@ describe('log group', () => {
     expect(metric.metricName).toEqual('Field');
   });
 
+  test.each([
+    ['cross-account', '222222222222', 'us-east-1'],
+    ['cross-region', '111111111111', 'eu-west-1'],
+  ])('%s grants preserve log stream wildcard across environments', (_case, account, region) => {
+    const app = new App();
+    const producer = new Stack(app, 'Producer', {
+      env: { account: '111111111111', region: 'us-east-1' },
+    });
+    const consumer = new Stack(app, 'Consumer', {
+      env: { account, region },
+    });
+    const group = new LogGroup(producer, 'LogGroup', { logGroupName: 'shared-log-group' });
+    const reader = new iam.Role(consumer, 'Reader', { assumedBy: new iam.AccountRootPrincipal() });
+    const writer = new iam.Role(consumer, 'Writer', { assumedBy: new iam.AccountRootPrincipal() });
+
+    group.grantRead(reader);
+    group.grantWrite(writer);
+
+    const arn = (suffix: string) => ({
+      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, `:logs:us-east-1:111111111111:log-group:shared-log-group${suffix}`]],
+    });
+    const template = Template.fromStack(consumer);
+    expect(consumer.resolve(group.logGroupArn)).toEqual(arn(':*'));
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: [{
+          Action: READ_ACTIONS,
+          Effect: 'Allow',
+          Resource: [arn(''), arn(':*')],
+        }],
+      },
+    });
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: [{
+          Action: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+          Effect: 'Allow',
+          Resource: arn(':*'),
+        }],
+      },
+    });
+  });
+
   test('grant write', () => {
     // GIVEN
     const stack = new Stack();
