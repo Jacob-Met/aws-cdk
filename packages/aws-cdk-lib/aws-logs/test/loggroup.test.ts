@@ -488,6 +488,44 @@ describe('log group', () => {
     expect(metric.metricName).toEqual('Field');
   });
 
+  for (const [scenario, account, region] of [
+    ['different account', '222222222222', 'us-east-1'],
+    ['different region', '111111111111', 'us-west-2'],
+  ]) {
+    test('log group grants across ' + scenario + ' include the log stream ARN', () => {
+      const app = new App();
+      const producer = new Stack(app, 'Producer', {
+        env: { account: '111111111111', region: 'us-east-1' },
+      });
+      const consumer = new Stack(app, 'Consumer', {
+        env: { account, region },
+      });
+      const logGroup = new LogGroup(producer, 'LogGroup', { logGroupName: 'shared-log-group' });
+      const reader = new iam.Role(consumer, 'Reader', { assumedBy: new iam.AccountRootPrincipal() });
+      const writer = new iam.Role(consumer, 'Writer', { assumedBy: new iam.AccountRootPrincipal() });
+
+      logGroup.grantRead(reader);
+      logGroup.grantWrite(writer);
+
+      const policies = Template.fromStack(consumer).findResources('AWS::IAM::Policy');
+      const statements = Object.values(policies).flatMap(policy => policy.Properties.PolicyDocument.Statement);
+      const readStatement = statements.find(statement => statement.Action.includes('logs:FilterLogEvents'));
+      const writeStatement = statements.find(statement => statement.Action.includes('logs:CreateLogStream'));
+
+      expect(readStatement).toBeDefined();
+      expect(writeStatement).toBeDefined();
+      expect(readStatement.Resource).toHaveLength(2);
+      const readResources = readStatement.Resource.map((resource: object) => JSON.stringify(resource));
+      const writeResource = JSON.stringify(writeStatement.Resource);
+      expect(readResources[0]).toContain('shared-log-group');
+      expect(readResources[0]).not.toContain('shared-log-group:*');
+      expect(readResources[1]).toContain('shared-log-group:*');
+      expect(writeResource).toContain('shared-log-group:*');
+      expect(writeResource).toContain('111111111111');
+      expect(writeResource).toContain('us-east-1');
+    });
+  }
+
   test('grant write', () => {
     // GIVEN
     const stack = new Stack();
