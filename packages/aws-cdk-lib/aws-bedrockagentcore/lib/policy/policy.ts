@@ -237,8 +237,11 @@ export class Policy extends PolicyBase {
 
     this.__resource = new CfnPolicy(this, 'Resource', cfnProps);
 
-    // Create dependency ONLY on the PolicyEngine's CFN resource to avoid circular dependencies with the PolicyEngine construct
-    this.__resource.node.addDependency(this.policyEngine.node.defaultChild!);
+    // Depend only on a locally defined engine resource; imported engines have no default child.
+    const engineResource = this.policyEngine.node.defaultChild;
+    if (engineResource) {
+      this.__resource.node.addDependency(engineResource);
+    }
 
     this.policyId = this.__resource.attrPolicyId;
     this.policyArn = this.__resource.attrPolicyArn;

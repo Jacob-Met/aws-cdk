@@ -85,6 +85,31 @@ describe('Policy default tests', () => {
   });
 });
 
+describe('Policy with imported engine', () => {
+  test('creates a policy without depending on an absent engine resource', () => {
+    const app = new cdk.App();
+    const stack = new cdk.Stack(app, 'imported-engine-stack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+    });
+    const engine = PolicyEngine.fromPolicyEngineAttributes(stack, 'Engine', {
+      policyEngineArn: 'arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/example-abc123',
+    });
+
+    new Policy(stack, 'Policy', {
+      policyEngine: engine,
+      policyName: 'imported_engine_policy',
+      statement: PolicyStatement.fromCedar('permit(principal, action, resource);'),
+    });
+
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::BedrockAgentCore::PolicyEngine', 0);
+    template.hasResourceProperties('AWS::BedrockAgentCore::Policy', {
+      Name: 'imported_engine_policy',
+      PolicyEngineId: 'example-abc123',
+    });
+  });
+});
+
 describe('Policy with auto-generated name', () => {
   let template: Template;
   let app: cdk.App;
