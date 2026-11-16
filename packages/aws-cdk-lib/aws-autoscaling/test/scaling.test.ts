@@ -1,5 +1,5 @@
 import { Construct } from 'constructs';
-import { Template } from '../../assertions';
+import { Annotations, Match, Template } from '../../assertions';
 import * as cloudwatch from '../../aws-cloudwatch';
 import * as ec2 from '../../aws-ec2';
 import * as elbv2 from '../../aws-elasticloadbalancingv2';
@@ -26,6 +26,25 @@ describe('scaling', () => {
           TargetValue: 30,
         },
       });
+      Annotations.fromStack(stack).hasNoWarning('*', Match.stringLikeRegexp('cooldownOnTargetTrackingScaling'));
+    });
+
+    test('target tracking ignores unsupported cooldown and warns with an alternative', () => {
+      const stack = new cdk.Stack();
+      const fixture = new ASGFixture(stack, 'Fixture');
+
+      fixture.asg.scaleOnCpuUtilization('ScaleCpu', {
+        targetUtilizationPercent: 50,
+        cooldown: cdk.Duration.minutes(5),
+        estimatedInstanceWarmup: cdk.Duration.minutes(3),
+      });
+
+      Template.fromStack(stack).hasResourceProperties('AWS::AutoScaling::ScalingPolicy', {
+        PolicyType: 'TargetTrackingScaling',
+        EstimatedInstanceWarmup: 180,
+        Cooldown: Match.absent(),
+      });
+      Annotations.fromStack(stack).hasWarning('*', Match.stringLikeRegexp('cooldownOnTargetTrackingScaling'));
     });
 
     test('network ingress', () => {

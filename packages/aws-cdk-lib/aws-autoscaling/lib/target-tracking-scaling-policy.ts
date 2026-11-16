@@ -2,7 +2,7 @@ import { Construct } from 'constructs';
 import { CfnScalingPolicy } from './autoscaling.generated';
 import type * as cloudwatch from '../../aws-cloudwatch';
 import type { Duration } from '../../core';
-import { ValidationError } from '../../core';
+import { Annotations, ValidationError } from '../../core';
 import { lit } from '../../core/lib/private/literal-string';
 import type { IAutoScalingGroupRef } from '../../interfaces/generated/aws-autoscaling-interfaces.generated';
 
@@ -28,16 +28,20 @@ export interface BaseTargetTrackingProps {
   readonly disableScaleIn?: boolean;
 
   /**
-   * Period after a scaling completes before another scaling activity can start.
+   * Cooldown is only supported by simple scaling policies.
    *
-   * @default - The default cooldown configured on the AutoScalingGroup.
+   * Target tracking policies ignore this value. Use estimatedInstanceWarmup
+   * to configure the instance warmup for target tracking instead.
+   *
+   * @default - No cooldown
+   * @deprecated This value has no effect on target tracking policies.
    */
   readonly cooldown?: Duration;
 
   /**
    * Estimated time until a newly launched instance can send metrics to CloudWatch.
    *
-   * @default - Same as the cooldown.
+   * @default - The group's default instance warmup, or its default cooldown if unset.
    */
   readonly estimatedInstanceWarmup?: Duration;
 }
@@ -126,10 +130,16 @@ export class TargetTrackingScalingPolicy extends Construct {
       throw new ValidationError(lit`DirectMetricsSupportedTargetTracking`, 'Only direct metrics are supported for Target Tracking. Use Step Scaling or supply a Metric object.', this);
     }
 
+    if (props.cooldown !== undefined) {
+      Annotations.of(this).addWarningV2(
+        '@aws-cdk/aws-autoscaling:cooldownOnTargetTrackingScaling',
+        "'Cooldown' only applies to SimpleScaling policies and is ignored for target tracking. Use 'estimatedInstanceWarmup' instead.",
+      );
+    }
+
     this.resource = new CfnScalingPolicy(this, 'Resource', {
       policyType: 'TargetTrackingScaling',
       autoScalingGroupName: props.autoScalingGroup.autoScalingGroupRef.autoScalingGroupName,
-      cooldown: props.cooldown && props.cooldown.toSeconds().toString(),
       estimatedInstanceWarmup: props.estimatedInstanceWarmup && props.estimatedInstanceWarmup.toSeconds(),
       targetTrackingConfiguration: {
         customizedMetricSpecification: renderCustomMetric(props.customMetric),
