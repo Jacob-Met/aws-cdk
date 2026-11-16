@@ -1,5 +1,6 @@
 import { Match, Template } from '../../../../assertions';
 import * as iam from '../../../../aws-iam';
+import * as secretsmanager from '../../../../aws-secretsmanager';
 import * as cdk from '../../../../core';
 import type { OAuth2AuthorizationServerMetadata } from '../../../lib';
 import {
@@ -29,6 +30,59 @@ describe('ApiKeyCredentialProvider', () => {
       ApiKey: 'super-secret',
       Tags: Match.arrayWith([{ Key: 'team', Value: 'agents' }]),
     });
+  });
+
+  test('external Secrets Manager API key uses a secret reference without exposing key material', () => {
+    const stack = new cdk.Stack(new cdk.App(), 'Stack', {
+      env: { account: '123456789012', region: 'us-east-1' },
+    });
+    const secret = secretsmanager.Secret.fromSecretCompleteArn(
+      stack, 'ExistingSecret', 'arn:aws:secretsmanager:us-east-1:123456789012:secret:example-123abc',
+    );
+
+    const provider = ApiKeyCredentialProvider.fromSecret(stack, 'Provider', {
+      secret,
+      jsonKey: 'apiToken',
+      apiKeyCredentialProviderName: 'external_provider',
+    });
+
+    const role = new iam.Role(stack, 'Role', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+    });
+    provider.grantUse(role);
+
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::BedrockAgentCore::ApiKeyCredentialProvider', {
+      Name: 'external_provider',
+      ApiKeySecretSource: 'EXTERNAL',
+      ApiKeySecretConfig: {
+        SecretId: secret.secretArn,
+        JsonKey: 'apiToken',
+      },
+      ApiKey: Match.absent(),
+    });
+    expect(provider.bindForGatewayApiKeyTarget().secretArn).toBe(secret.secretArn);
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: Match.arrayWith(['secretsmanager:GetSecretValue']),
+            Resource: secret.secretArn,
+          }),
+        ]),
+      },
+    });
+  });
+
+  test.each(['', 'a'.repeat(129)])('external secret JSON key %p is rejected', (jsonKey) => {
+    const stack = new cdk.Stack(new cdk.App(), 'Stack');
+    const secret = secretsmanager.Secret.fromSecretCompleteArn(
+      stack, 'ExistingSecret', 'arn:aws:secretsmanager:us-east-1:123456789012:secret:example-123abc',
+    );
+    expect(() => ApiKeyCredentialProvider.fromSecret(stack, 'Provider', { secret, jsonKey }))
+      .toThrow(/jsonKey must be between 1 and 128 characters/);
+    Template.fromStack(stack).resourceCountIs('AWS::BedrockAgentCore::ApiKeyCredentialProvider', 0);
   });
 
   test('grantRead scopes actions to provider ARN and parent resources', () => {
