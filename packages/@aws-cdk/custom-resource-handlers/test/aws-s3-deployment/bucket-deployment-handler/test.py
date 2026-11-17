@@ -1112,6 +1112,17 @@ def invoke_handler(requestType, resourceProps, old_resource_props=None, physical
         os.environ[index.ENV_KEY_MOUNT_PATH] = outdir
         os.environ[index.ENV_KEY_SKIP_CLEANUP] = "1"
 
+    # These legacy CLI contract tests assert the substitution-capable path.
+    # Exercise the new marker-free default separately with a real ZIP/S3 stub.
+    if (requestType in ('Create', 'Update') and
+            resourceProps.get('Extract', 'true') == 'true' and
+            'SourceMarkers' not in resourceProps and 'SourceObjectKeys' in resourceProps):
+        event['ResourceProperties'] = dict(resourceProps)
+        event['ResourceProperties']['SourceMarkers'] = [
+            {'__legacy_fixture_marker__': 'unused'}
+            for _ in resourceProps['SourceObjectKeys']
+        ]
+
     #--------------------
     # invoke the handler
     #--------------------
@@ -1150,6 +1161,251 @@ def invoke_handler(requestType, resourceProps, old_resource_props=None, physical
     assert_field('LogicalResourceId', '<logical-resource-id>')
 
     return resp
+
+
+class FakeArchiveS3:
+    """Deterministic ZIP-source and S3-object model; no AWS access required."""
+    def __init__(self):
+        self.sources = {}
+        self.objects = {}
+        self.uploads = []
+        self.deletes = []
+        self.delete_batches = []
+        self.fail_key = None
+
+    def add_zip(self, bucket, key, files):
+        from io import BytesIO
+        from zipfile import ZipFile, ZIP_DEFLATED
+        data = BytesIO()
+        with ZipFile(data, 'w', compression=ZIP_DEFLATED) as z:
+            for name, body in files.items():
+                z.writestr(name, body)
+        self.sources[(bucket, key)] = data.getvalue()
+
+    def add_object(self, bucket, key, body, etag=None):
+        import hashlib
+        self.objects[(bucket, key)] = {
+            'Body': body, 'Size': len(body),
+            'ETag': etag or '"' + hashlib.md5(body, usedforsecurity=False).hexdigest() + '"',
+        }
+
+    def download_file(self, bucket, key, filename):
+        with open(filename, 'wb') as f:
+            f.write(self.sources[(bucket, key)])
+
+    def get_paginator(self, action):
+        assert action == 'list_objects_v2'
+        return self
+
+    def paginate(self, Bucket, Prefix):
+        return [{'Contents': [
+            {'Key': key, 'Size': val['Size'], 'ETag': val['ETag']}
+            for (bucket, key), val in self.objects.items()
+            if bucket == Bucket and key.startswith(Prefix)
+        ]}]
+
+    def upload_fileobj(self, stream, bucket, key, ExtraArgs=None, Config=None):
+        if key == self.fail_key:
+            raise RuntimeError('injected transfer failure')
+        body = stream.read()
+        self.add_object(bucket, key, body)
+        self.objects[(bucket, key)]['ExtraArgs'] = ExtraArgs
+        self.uploads.append(key)
+
+    def delete_objects(self, Bucket, Delete):
+        self.delete_batches.append(len(Delete['Objects']))
+        for item in Delete['Objects']:
+            key = item['Key']
+            self.objects.pop((Bucket, key), None)
+            self.deletes.append(key)
+        return {}
+
+
+class TestArchiveAwareSync(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeArchiveS3()
+
+    def deploy(self, sources, dest='s3://dst/site', prune=True,
+               excludes=None, includes=None):
+        with patch.object(index, 's3', self.fake):
+            with patch.object(index, 'aws_command', side_effect=AssertionError('CLI must not run')):
+                index.s3_deploy(sources, dest, {}, {}, prune,
+                    excludes or [], includes or [], [{} for _ in sources],
+                    True, [{} for _ in sources])
+
+    def test_overlay_and_hash_based_incremental_transfer_with_same_size_change(self):
+        payload = b'\x00\xff' * (1024 * 1024)
+        self.fake.add_zip('src', 'one.zip', {
+            'app.js': b'first', 'data.wasm': payload, 'empty/': b'',
+        })
+        self.fake.add_zip('src', 'two.zip', {
+            'app.js': b'later', 'new.txt': b'static',
+        })
+        self.fake.add_object('dst', 'site/stale.txt', b'delete')
+        sources = ['s3://src/one.zip', 's3://src/two.zip']
+
+        self.deploy(sources)
+        self.assertEqual(self.fake.objects[('dst', 'site/app.js')]['Body'], b'later')
+        self.assertEqual(self.fake.objects[('dst', 'site/data.wasm')]['Body'], payload)
+        self.assertEqual(self.fake.objects[('dst', 'site/new.txt')]['Body'], b'static')
+        self.assertNotIn(('dst', 'site/stale.txt'), self.fake.objects)
+        self.assertEqual(sorted(self.fake.uploads),
+                         ['site/app.js', 'site/data.wasm', 'site/new.txt'])
+        self.assertEqual(len(self.fake.deletes), 1)
+
+        self.deploy(sources)
+        self.assertEqual(len(self.fake.uploads), 3)  # unchanged objects never re-upload
+        self.assertEqual(len(self.fake.deletes), 1)
+
+        # Same-size mutations must NOT be skipped (unlike --size-only).
+        self.fake.add_zip('src', 'two.zip', {'app.js': b'other', 'new.txt': b'static'})
+        self.deploy(sources)
+        self.assertEqual(self.fake.uploads[-1], 'site/app.js')
+        self.assertEqual(len(self.fake.uploads), 4)
+        self.assertEqual(self.fake.objects[('dst', 'site/app.js')]['Body'], b'other')
+
+    def test_filters_prefix_and_pruning_preserve_excluded_objects(self):
+        self.fake.add_zip('src', 'site.zip', {
+            'assets/app.js': b'keep',
+            'secret/private.txt': b'not uploaded',
+            'secret/public.js': b'yes',
+        })
+        self.fake.add_object('dst', 'site/old.js', b'stale')
+        self.fake.add_object('dst', 'site/secret/private.txt', b'keep excluded')
+        self.fake.add_object('dst', 'elsewhere/old.js', b'outside')
+        self.deploy(['s3://src/site.zip'], excludes=['secret/*'],
+                    includes=['secret/public.js'])
+        self.assertEqual(sorted(self.fake.uploads),
+                         ['site/assets/app.js', 'site/secret/public.js'])
+        self.assertEqual(self.fake.deletes, ['site/old.js'])
+        self.assertIn(('dst', 'site/secret/private.txt'), self.fake.objects)
+        self.assertIn(('dst', 'elsewhere/old.js'), self.fake.objects)
+
+    def test_failed_upload_cannot_prune_or_report_success(self):
+        self.fake.add_zip('src', 'site.zip', {'ok.js': b'ok', 'broken.js': b'break'})
+        self.fake.add_object('dst', 'site/stale.js', b'stale')
+        self.fake.fail_key = 'site/broken.js'
+        with self.assertRaisesRegex(RuntimeError, 'injected transfer failure'):
+            self.deploy(['s3://src/site.zip'])
+        self.assertIn(('dst', 'site/stale.js'), self.fake.objects)
+        self.assertEqual(self.fake.deletes, [])
+
+    def test_opaque_remote_etag_never_skips_safely(self):
+        self.fake.add_zip('src', 'site.zip', {'binary.dat': b'unchanged'})
+        self.fake.add_object('dst', 'site/binary.dat', b'unchanged', '"opaque-2"')
+        self.deploy(['s3://src/site.zip'])
+        self.assertEqual(self.fake.uploads, ['site/binary.dat'])
+
+    def test_unsafe_archive_paths_are_normalized_like_extractall(self):
+        self.fake.add_zip('src', 'site.zip', {'../../escape.txt': b'a', 'a/../b.txt': b'b'})
+        self.deploy(['s3://src/site.zip'], dest='s3://dst/')
+        self.assertEqual(sorted(self.fake.uploads), ['a/b.txt', 'escape.txt'])
+
+    def test_large_destination_prunes_in_bounded_batches(self):
+        self.fake.add_zip('src', 'site.zip', {'current.js': b'keep'})
+        for i in range(1005):
+            self.fake.add_object('dst', 'site/stale-%04d.bin' % i, b'stale')
+        self.deploy(['s3://src/site.zip'])
+        self.assertEqual(self.fake.delete_batches, [1000, 5])
+        self.assertEqual(len(self.fake.deletes), 1005)
+        self.assertEqual(self.fake.objects[('dst', 'site/current.js')]['Body'], b'keep')
+
+    def test_upload_concurrency_scales_with_objects_and_stays_memory_bounded(self):
+        mib = 1024 * 1024
+        for files, largest, memory, expected in [
+            (1000, 4096, 1024, 32),
+            (200, 11 * mib, 1024, 32),
+            (40, 28 * mib, 1024, 18),
+            (1000, 64 * mib, 1024, 8),
+            (1000, 64 * mib, 512, 4),
+            (1000, 64 * mib, 128, 1),
+            (0, 0, 1024, 1),
+        ]:
+            with self.subTest(files=files, largest=largest, memory=memory):
+                workers = index.upload_worker_count(files, largest, memory)
+                self.assertEqual(workers, expected)
+                self.assertLessEqual(workers * min(largest, 64 * mib),
+                                     max(1, memory * mib // 2))
+
+    def test_s3_paths_preserve_opaque_object_keys(self):
+        self.assertEqual(index.s3_location('s3://a/prefix/a#b?c%20d'),
+                         ('a', 'prefix/a#b?c%20d'))
+        self.assertEqual(index.s3_location('s3://a//leading'),
+                         ('a', '/leading'))
+        for invalid in ('bucket/key', 's3://', 's3:///key'):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    index.s3_location(invalid)
+
+    def test_handler_default_markerless_runs_direct_path_and_invalidates_cdn(self):
+        self.fake.add_zip('assets', 'source.zip', {'index.html': b'<h1>It works</h1>'})
+        event = {
+            'RequestType': 'Create',
+            'ResponseURL': 'https://example.invalid/cfn',
+            'StackId': 'stack',
+            'RequestId': 'request',
+            'LogicalResourceId': 'deployment',
+            'ResourceProperties': {
+                'SourceBucketNames': ['assets'],
+                'SourceObjectKeys': ['source.zip'],
+                'DestinationBucketName': 'dst',
+                'DestinationBucketKeyPrefix': 'app',
+                'DistributionId': 'DIST1',
+            },
+        }
+        with patch.object(index, 's3', self.fake):
+            with patch.object(index, 'aws_command', side_effect=AssertionError('CLI forbidden')):
+                with patch.object(index, 'cloudfront_invalidate') as invalidate:
+                    with patch.object(index, 'cfn_send') as send:
+                        index.handler(event, object())
+        self.assertEqual(self.fake.objects[('dst', 'app/index.html')]['Body'],
+                         b'<h1>It works</h1>')
+        invalidate.assert_called_once_with('DIST1', ['/app/*'], True)
+        self.assertEqual(send.call_args.args[2], index.CFN_SUCCESS)
+
+    def test_sign_content_preserves_explicit_cli_payload_signing(self):
+        self.fake.add_zip('src', 'site.zip', {'app.js': b'hello'})
+        import shutil
+        with tempfile.TemporaryDirectory() as temp:
+            archive = os.path.join(temp, 'source.zip')
+            with open(archive, 'wb') as f:
+                f.write(self.fake.sources[('src', 'site.zip')])
+            calls = []
+
+            def fake_aws(*args):
+                calls.append(args)
+                if args[:2] == ('s3', 'cp'):
+                    shutil.copyfile(archive, args[-1])
+
+            with patch.object(index, 's3', self.fake):
+                with patch.object(index, 'aws_command', side_effect=fake_aws):
+                    index.s3_deploy(['s3://src/site.zip'], 's3://dst/site', {},
+                        {}, True, [], [], [{}], True, [{}], sign_content=True)
+            self.assertTrue(any(c[:2] == ('s3', 'sync') for c in calls))
+            self.assertEqual(self.fake.uploads, [])
+
+    def test_markerful_metadata_and_nonextract_paths_stay_on_cli(self):
+        self.fake.add_zip('src', 'site.zip', {'app.js': b'hello'})
+        from shutil import copyfile
+        with patch.object(index, 's3', self.fake):
+            calls = []
+            def fake_aws(*args):
+                calls.append(args)
+                if args[:2] == ('s3', 'cp'):
+                    copyfile(next(iter(self._source_files.values())), args[-1])
+
+            # Archive staging for the substitution-enabled path.
+            with tempfile.TemporaryDirectory() as temp:
+                local = os.path.join(temp, 'src.zip')
+                with open(local, 'wb') as f:
+                    f.write(self.fake.sources[('src', 'site.zip')])
+                self._source_files = {'archive': local}
+                with patch.object(index, 'aws_command', side_effect=fake_aws):
+                    index.s3_deploy(['s3://src/site.zip'], 's3://dst/site', {}, {},
+                        True, [], [], [{'MISSING': 'none'}], True, [{}])
+                self.assertTrue(any(c[:2] == ('s3', 'sync') for c in calls))
+                self.assertEqual(self.fake.uploads, [])
+
 
 if __name__ == '__main__':
     unittest.main()

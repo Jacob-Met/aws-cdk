@@ -1,17 +1,22 @@
 import contextlib
+import fnmatch
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import shutil
 import subprocess
 import tempfile
 import urllib.parse
 import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import ZipFile
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError, WaiterError
 
@@ -24,7 +29,8 @@ cloudfront = boto3.client('cloudfront', config=Config(
         'mode': 'standard',
     }
 ))
-s3 = boto3.client('s3')
+# The archive-aware uploader can issue up to 32 concurrent object requests.
+s3 = boto3.client('s3', config=Config(max_pool_connections=32))
 
 CFN_SUCCESS = "SUCCESS"
 CFN_FAILED = "FAILED"
@@ -141,7 +147,7 @@ def handler(event, context):
             aws_command("s3", "rm", old_s3_dest, "--recursive")
 
         if request_type == "Update" or request_type == "Create":
-            s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, exclude, include, source_markers, extract, source_markers_config)
+            s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, exclude, include, source_markers, extract, source_markers_config, sign_content)
 
         # after the sync has run, optionally look up the S3 version IDs of the deployed objects.
         # only performed when the consumer opted in by reading `objectVersionIds` (extract=false).
@@ -186,9 +192,16 @@ def sanitize_message(message):
 
 #---------------------------------------------------------------------------------------------------
 # populate all files from s3_source_zips to a destination bucket
-def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, exclude, include, source_markers, extract, source_markers_config):
+def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, exclude, include, source_markers, extract, source_markers_config, sign_content=False):
     if len(s3_source_zips) < len(source_markers):
         raise Exception(f"Can never have more SourceMarkers ({len(source_markers)}) than SourceObjectKeys ({len(s3_source_zips)})")
+
+    # The common static-asset case does not need a materialized extraction tree.
+    # Reconcile archive members directly against S3 object hashes instead of
+    # spawning a CLI transfer and re-uploading unchanged extracted files.
+    # Retain CLI sync for substitution/metadata and unextracted-archive paths.
+    if extract and not sign_content and not any(source_markers) and not user_metadata and not system_metadata:
+        return s3_deploy_zip_members(s3_source_zips, s3_dest, prune, exclude, include)
 
     # create a temporary working directory in /tmp or if enabled an attached efs volume
     if ENV_KEY_MOUNT_PATH in os.environ:
@@ -248,6 +261,172 @@ def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, ex
         s3_command.extend([contents_dir, s3_dest])
         s3_command.extend(create_metadata_args(user_metadata, system_metadata))
         aws_command(*s3_command)
+    finally:
+        if not os.getenv(ENV_KEY_SKIP_CLEANUP):
+            shutil.rmtree(workdir)
+
+
+#---------------------------------------------------------------------------------------------------
+def s3_location(uri):
+    """Split an S3 URI while preserving opaque object-key characters."""
+    if not uri.startswith("s3://"):
+        raise ValueError("Expected an s3://bucket/key URL")
+    bucket, separator, key = uri[5:].partition("/")
+    if not bucket or not separator:
+        raise ValueError("Expected an s3://bucket/key URL")
+    # S3 keys are opaque: '#' and '?' are literal characters here, not
+    # URL fragments or query strings. Do not percent-decode a literal key.
+    return bucket, key
+
+
+def zip_member_name(filename):
+    """Match ZipFile.extractall's relative-path normalization on Lambda (POSIX)."""
+    return "/".join(piece for piece in filename.split("/") if piece not in ("", ".", ".."))
+
+
+def included_for_sync(path, excludes, includes):
+    """Match the s3 sync filter order: every exclude, then every include."""
+    accepted = True
+    for pattern in excludes:
+        if fnmatch.fnmatchcase(path, pattern):
+            accepted = False
+    for pattern in includes:
+        if fnmatch.fnmatchcase(path, pattern):
+            accepted = True
+    return accepted
+
+
+def zip_member_md5(archive, member):
+    digest = hashlib.md5(usedforsecurity=False)
+    with archive.open(member) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_worker_count(files, largest_file_bytes, memory_mb):
+    """Cap aggregate upload buffers to half the Lambda memory allocation."""
+    transfer_buffer = min(largest_file_bytes, 64 * 1024 * 1024)
+    memory_budget = max(1, memory_mb * 1024 * 1024 // 2)
+    by_memory = max(1, memory_budget // max(1, transfer_buffer))
+    return min(32, max(1, files), by_memory)
+
+
+def s3_deploy_zip_members(s3_sources, s3_dest, prune, excludes, includes):
+    """Stream ordered ZIP members to S3, skipping identical remote objects.
+
+    Avoids materializing an extracted tree and unnecessary uploads. The legacy
+    CLI path remains authoritative for substitution and explicit metadata.
+    """
+    dest_bucket, dest_prefix = s3_location(s3_dest)
+    if dest_prefix and not dest_prefix.endswith("/"):
+        dest_prefix += "/"
+
+    if ENV_KEY_MOUNT_PATH in os.environ:
+        workdir = os.path.join(os.getenv(ENV_KEY_MOUNT_PATH), str(uuid4()))
+        os.mkdir(workdir)
+    else:
+        workdir = tempfile.mkdtemp()
+
+    try:
+        with contextlib.ExitStack() as stack:
+            # Source archives are compressed on disk, not fully extracted. Keep
+            # each archive alive until transfers finish; later sources win.
+            members = {}
+            for index, uri in enumerate(s3_sources):
+                source_bucket, source_key = s3_location(uri)
+                archive_path = os.path.join(workdir, str(index) + ".zip")
+                s3.download_file(source_bucket, source_key, archive_path)
+                archive = stack.enter_context(ZipFile(archive_path))
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    name = zip_member_name(member.filename)
+                    if name and included_for_sync(name, excludes, includes):
+                        members[name] = (archive, member)
+
+            # Only retain metadata for desired members. Stream stale keys to
+            # disk so large destination buckets do not exhaust Lambda memory.
+            desired = {dest_prefix + name for name in members}
+            existing = {}
+            stale_path = os.path.join(workdir, "stale-objects.jsonl")
+            with open(stale_path, "w", encoding="utf-8") as stale_file:
+                for page in s3.get_paginator("list_objects_v2").paginate(
+                        Bucket=dest_bucket, Prefix=dest_prefix):
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"]
+                        if key in desired:
+                            existing[key] = obj
+                        elif prune and included_for_sync(
+                                key[len(dest_prefix):], excludes, includes):
+                            stale_file.write(json.dumps(key) + "\n")
+
+            # The AWS CLI is not content-addressed: fresh ZIP extraction mtimes
+            # cause repeated sync uploads. ETag=MD5 holds for single-part,
+            # non-KMS S3 objects; otherwise upload conservatively.
+            changes = []
+            for name, (archive, member) in members.items():
+                key = dest_prefix + name
+                remote = existing.get(key)
+                if remote and remote.get("Size") == member.file_size:
+                    etag = remote.get("ETag", "").strip('"').lower()
+                    if len(etag) == 32 and all(ch in "0123456789abcdef" for ch in etag):
+                        if zip_member_md5(archive, member) == etag:
+                            continue
+                changes.append((key, name, archive, member))
+
+            memory_mb = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1024"))
+            largest_file = max((member.file_size for _, _, _, member in changes), default=0)
+            workers = upload_worker_count(len(changes), largest_file, memory_mb)
+            config = TransferConfig(
+                multipart_threshold=64 * 1024 * 1024,
+                max_concurrency=1,
+                use_threads=False,
+            )
+
+            def upload(entry):
+                key, name, archive, member = entry
+                content_type, content_encoding = mimetypes.guess_type(name)
+                args = {}
+                if content_type:
+                    args["ContentType"] = content_type
+                if content_encoding:
+                    args["ContentEncoding"] = content_encoding
+                with archive.open(member) as stream:
+                    s3.upload_fileobj(stream, dest_bucket, key,
+                                      ExtraArgs=args, Config=config)
+
+            # All futures complete (including on failure) before archives are
+            # closed. Failed uploads cannot trigger stale-object deletion.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for _ in pool.map(upload, changes):
+                    pass
+
+            deleted_count = 0
+            if prune:
+                def delete_batch(keys):
+                    response = s3.delete_objects(
+                        Bucket=dest_bucket,
+                        Delete={"Objects": [{"Key": key} for key in keys]}
+                    )
+                    if response.get("Errors"):
+                        raise RuntimeError("Unable to delete stale S3 objects: %s" %
+                                           sanitize_message(response["Errors"]))
+
+                batch = []
+                with open(stale_path, encoding="utf-8") as stale_file:
+                    for line in stale_file:
+                        batch.append(json.loads(line))
+                        if len(batch) == 1000:
+                            delete_batch(batch)
+                            deleted_count += len(batch)
+                            batch.clear()
+                    if batch:
+                        delete_batch(batch)
+                        deleted_count += len(batch)
+
+            logger.info("| ZIP member sync: uploaded %d, unchanged %d, deleted %d" %
+                        (len(changes), len(members) - len(changes), deleted_count))
     finally:
         if not os.getenv(ENV_KEY_SKIP_CLEANUP):
             shutil.rmtree(workdir)
