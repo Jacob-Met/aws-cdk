@@ -204,6 +204,9 @@ def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, ex
     os.mkdir(contents_dir)
 
     try:
+        # Count archive members while extracting, without an extra pass over their contents.
+        # The S3 CLI transfer pool is the critical path for large static asset trees.
+        file_count = 0
         # download the archive from the source and extract to "contents"
         for i in range(len(s3_source_zips)):
             s3_source_zip = s3_source_zips[i]
@@ -216,10 +219,16 @@ def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, ex
                 aws_command("s3", "cp", s3_source_zip, archive)
                 logger.info("| extracting archive to: %s\n" % contents_dir)
                 logger.info("| markers: %s" % sanitize_message(markers))
-                extract_and_replace_markers(archive, contents_dir, markers, markers_config)
+                file_count += extract_and_replace_markers(archive, contents_dir, markers, markers_config)
             else:
                 logger.info("| copying archive to: %s\n" % contents_dir)
                 aws_command("s3", "cp", s3_source_zip, contents_dir)
+                file_count += 1
+
+        # Keep aws s3 sync as the source of truth for filters, metadata, object
+        # comparisons and pruning. Only its transfer pool needs to scale with
+        # the number of objects; the default ten threads bottleneck big trees.
+        configure_sync_parallelism(file_count)
 
         # sync from "contents" to destination
 
@@ -242,6 +251,20 @@ def s3_deploy(s3_source_zips, s3_dest, user_metadata, system_metadata, prune, ex
     finally:
         if not os.getenv(ENV_KEY_SKIP_CLEANUP):
             shutil.rmtree(workdir)
+
+#---------------------------------------------------------------------------------------------------
+def configure_sync_parallelism(file_count):
+    """Use a wider S3 transfer pool for many small objects, bounded by Lambda memory."""
+    if file_count < 64:
+        return
+
+    memory_mb = int(os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', '1024'))
+    if memory_mb < 512:
+        return
+
+    workers = 32 if file_count >= 256 and memory_mb >= 1024 else 16
+    logger.info("| syncing %s archive members with %s S3 transfer workers" % (file_count, workers))
+    aws_command("configure", "set", "default.s3.max_concurrent_requests", str(workers))
 
 #---------------------------------------------------------------------------------------------------
 # look up the S3 version IDs of the deployed objects.
@@ -382,12 +405,20 @@ def bucket_owned(bucketName, keyPrefix):
 def extract_and_replace_markers(archive, contents_dir, markers, markers_config):
     with ZipFile(archive, "r") as zip:
         zip.extractall(contents_dir)
+        members = zip.infolist()
+
+        # Empty marker maps are the common case for static assets: no file
+        # needs to be opened or even stat'ed for substitution.
+        if not markers:
+            return sum(not member.is_dir() for member in members)
 
         # replace markers for this source
-        for file in zip.namelist():
-            file_path = os.path.join(contents_dir, file)
-            if os.path.isdir(file_path): continue
+        for member in members:
+            if member.is_dir():
+                continue
+            file_path = os.path.join(contents_dir, member.filename)
             replace_markers(file_path, markers, markers_config)
+        return sum(not member.is_dir() for member in members)
 
 
 def replace_markers(filename, markers, markers_config):
