@@ -117,6 +117,73 @@ class TestHandler(unittest.TestCase):
             self.assertNotIn('\r', logged)
             self.assertNotIn('\n', logged)
 
+    def test_sync_parallelism_bounded_by_archive_size_and_lambda_memory(self):
+        for files, memory, workers in (
+            (63, 1024, None),
+            (64, 1024, 16),
+            (255, 1024, 16),
+            (256, 1024, 32),
+            (500, 512, 16),
+            (500, 256, None),
+        ):
+            with self.subTest(files=files, memory=memory):
+                with patch.dict(os.environ, {'AWS_LAMBDA_FUNCTION_MEMORY_SIZE': str(memory)}):
+                    with patch.object(index, 'aws_command') as run:
+                        index.configure_sync_parallelism(files)
+                if workers is None:
+                    run.assert_not_called()
+                else:
+                    run.assert_called_once_with('configure', 'set',
+                        'default.s3.max_concurrent_requests', str(workers))
+
+    def test_empty_markers_never_read_archive_members_for_substitution(self):
+        from zipfile import ZipFile
+        with tempfile.TemporaryDirectory() as workdir:
+            archive = os.path.join(workdir, 'source.zip')
+            contents = os.path.join(workdir, 'contents')
+            with ZipFile(archive, 'w') as z:
+                z.writestr('assets/', b'')
+                z.writestr('assets/app.wasm', b'\x00\xff' * (1024 * 1024))
+                z.writestr('assets/app.js', b'const a = 1;')
+
+            with patch.object(index, 'replace_markers', side_effect=AssertionError('unexpected scan')):
+                files = index.extract_and_replace_markers(archive, contents, {}, {})
+            self.assertEqual(files, 2)
+            with open(os.path.join(contents, 'assets', 'app.wasm'), 'rb') as data:
+                self.assertEqual(len(data.read()), 2 * 1024 * 1024)
+
+    def test_large_zip_drives_sync_pool_without_changing_sync_semantics(self):
+        import shutil
+        from zipfile import ZipFile
+        with tempfile.TemporaryDirectory() as workdir:
+            archive = os.path.join(workdir, 'source.zip')
+            with ZipFile(archive, 'w') as z:
+                for i in range(300):
+                    z.writestr('static/item-%03d.js' % i, b'console.log(1)')
+            calls = []
+
+            def fake_aws(*args):
+                calls.append(args)
+                if args[:2] == ('s3', 'cp'):
+                    shutil.copyfile(archive, args[-1])
+                if args[:2] == ('s3', 'sync'):
+                    self.assertIn('--delete', args)
+                    self.assertIn('--exclude', args)
+                    self.assertIn('--include', args)
+                    self.assertTrue(os.path.exists(os.path.join(args[args.index('--include') + 2], 'static', 'item-299.js')))
+
+            with patch.dict(os.environ, {'AWS_LAMBDA_FUNCTION_MEMORY_SIZE': '1024'}):
+                with patch.object(index, 'aws_command', side_effect=fake_aws):
+                    index.s3_deploy(['s3://source/archive.zip'], 's3://destination/prefix',
+                        {'team': 'cdn'}, {'cache-control': 'public, max-age=3600'},
+                        True, ['*.tmp'], ['*.js'], [{}], True, [{}])
+
+            self.assertEqual([call[:2] for call in calls],
+                [('s3', 'cp'), ('configure', 'set'), ('s3', 'sync')])
+            self.assertEqual(calls[1][-1], '32')
+            self.assertIn('--metadata', calls[2])
+            self.assertIn('--cache-control', calls[2])
+
     def test_create_update(self):
         invoke_handler("Create", {
             "SourceBucketNames": ["<source-bucket>"],
