@@ -56,7 +56,7 @@ export function validateTemplates(root: IConstruct, outdir: string, assembly: pr
 
   if (stacksByPlugin.size === 0) return;
 
-  const reports: NamedValidationPluginReport[] = doInvokeValidationPlugins(outdir, Array.from(stacksByPlugin), root);
+  const reports: NamedValidationPluginReport[] = doInvokeValidationPlugins(outdir, Array.from(stacksByPlugin), root, assemblies.values());
 
   // When the default validation plugin is not explicitly opted-in, downgrade
   // its errors to warnings so synthesis does not fail.
@@ -436,12 +436,13 @@ function doInvokeValidationPlugins(
   outdir: string,
   plugins: Array<[IPolicyValidationPlugin, Set<private_cxapi.CloudFormationStackArtifact>]>,
   root: App,
+  assemblies: Iterable<private_cxapi.CloudAssembly>,
 ) {
   const untrustedPlugins = new Set(Array.from(plugins.values())
     .map(p => p[0])
     .filter(p => !isTrustedPlugin(p)));
 
-  const preExistingFileHashes = untrustedPlugins.size > 0 && root._confirmValidationPluginsDoNotMutate ? snapshotFileHashes(outdir) : undefined;
+  const preExistingFileHashes = untrustedPlugins.size > 0 && root._confirmValidationPluginsDoNotMutate ? snapshotFileHashes(outdir, assemblies) : undefined;
 
   const ret = plugins.flatMap(([plugin, stacks]) => invokeSinglePlugin(plugin, Array.from(stacks)));
 
@@ -528,9 +529,34 @@ function getBooleanContext(root: IConstruct, key: string, defaultValue: boolean)
   return raw !== false && raw !== 'false';
 }
 
-function snapshotFileHashes(dir: string): Map<string, string> {
+/**
+ * Staged assets are immutable deploy inputs, but old `asset.<hash>` entries can
+ * remain in the assembly directory after many unrelated synths. Only the asset
+ * manifests of this synthesis tell us which staged sources are deployable.
+ */
+function currentAssetSources(assemblies: Iterable<private_cxapi.CloudAssembly>): Set<string> {
+  const sources = new Set<string>();
+  for (const assembly of assemblies) {
+    for (const artifact of assembly.artifacts) {
+      if (!private_cxapi.AssetManifestArtifact.isAssetManifestArtifact(artifact)) continue;
+      const manifestDirectory = path.dirname(artifact.file);
+      for (const file of Object.values(artifact.contents.files ?? {})) {
+        if (file.source.path) sources.add(path.resolve(manifestDirectory, file.source.path));
+      }
+      for (const image of Object.values(artifact.contents.dockerImages ?? {})) {
+        if (image.source.directory) sources.add(path.resolve(manifestDirectory, image.source.directory));
+        for (const contextDirectory of Object.values(image.source.dockerBuildContexts ?? {})) {
+          sources.add(path.resolve(manifestDirectory, contextDirectory));
+        }
+      }
+    }
+  }
+  return sources;
+}
+
+function snapshotFileHashes(dir: string, assemblies: Iterable<private_cxapi.CloudAssembly>): Map<string, string> {
   const hashes = new Map<string, string>();
-  for (const filePath of collectFilePaths(dir)) {
+  for (const filePath of collectFilePaths(dir, currentAssetSources(assemblies))) {
     hashes.set(filePath, hashFile(filePath));
   }
   return hashes;
@@ -545,30 +571,47 @@ function hasModifiedPreExistingFiles(snapshot: Map<string, string>): boolean {
   return false;
 }
 
-function collectFilePaths(dir: string): string[] {
+function collectFilePaths(dir: string, activeAssetSources: Set<string>): string[] {
   const results: string[] = [];
-  function walk(current: string) {
+  const root = path.resolve(dir);
+  const sourceAncestors = new Set<string>();
+  for (const source of activeAssetSources) {
+    let current = source;
+    while (current !== root) {
+      const relative = path.relative(root, current);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) break;
+      sourceAncestors.add(current);
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+
+  function walk(current: string, withinActiveAsset: boolean) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const full = path.join(current, entry.name);
+      // CDK's content-addressed asset staging is append-only. Skip historical
+      // assets that no manifest in this synthesis references, but always hash
+      // all files inside an active deployable asset (including nested assets).
+      if (!withinActiveAsset && /^asset\.[a-f0-9]{64}(?:\.[^./]+)?$/i.test(entry.name) && !sourceAncestors.has(full)) {
+        continue;
+      }
       if (entry.isDirectory()) {
-        // `isDirectory()` is false for a symlink-to-directory, so we never recurse
-        // through symlinks (avoids following links out of the cloud assembly / cycles).
-        walk(full);
+        // `isDirectory()` is false for symlinks, so do not recurse through
+        // symlinks outside the cloud assembly or into cycles.
+        walk(full, withinActiveAsset || activeAssetSources.has(full));
       } else if (entry.isFile()) {
-        // collect regular files
         results.push(full);
       } else if (entry.isSymbolicLink()) {
         /**
-         * Windows reparse points (OneDrive/Dropbox cloud placeholders, etc.)
-         * are classified as symlinks by readdir but as directories by lstat,
-         * so we implement an extra check with lstat here
+         * Windows cloud placeholders can be symlinks according to readdir but
+         * directories according to lstat; avoid EISDIR on those entries.
          * @see https://github.com/aws/aws-cdk/issues/38653
-         **/
+         */
         let st: fs.Stats;
         try {
           st = fs.lstatSync(full);
         } catch {
-          // nothing to snapshot
           continue;
         }
         if (st.isFile() || st.isSymbolicLink()) {
@@ -577,7 +620,7 @@ function collectFilePaths(dir: string): string[] {
       }
     }
   }
-  walk(dir);
+  walk(root, activeAssetSources.has(root));
   return results;
 }
 
