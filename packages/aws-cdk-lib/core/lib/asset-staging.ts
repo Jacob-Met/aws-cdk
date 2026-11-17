@@ -182,12 +182,6 @@ export class AssetStaging extends Construct {
       throw new ValidationError(lit`CannotFindAsset`, `Cannot find asset at ${this.sourcePath}`, this);
     }
 
-    const ignoreStrategy = IgnoreStrategy.fromCopyOptions(props, this.sourcePath);
-    // look for invalid (external) symlinks
-    if (props.follow == SymlinkFollowMode.BLOCK_EXTERNAL && fs.statSync(this.sourcePath).isDirectory()) {
-      validateInternalSymlinks(this.sourcePath, scope, props.follow, ignoreStrategy);
-    }
-
     this._sourceStats = fs.statSync(this.sourcePath);
 
     const outdir = stageOf(this)?.assetOutdir;
@@ -195,6 +189,45 @@ export class AssetStaging extends Construct {
       throw new ValidationError(lit`UnableToDetermineCloudAssembly`, 'unable to determine cloud assembly asset output directory. Assets must be defined indirectly within a "Stage" or an "App" scope', this);
     }
     this.assetOutdir = outdir;
+
+    // Asset output must not become asset input. A source tree containing its own
+    // assembly recursively copies its newly staged asset until path limits are hit,
+    // and previous assemblies also change its fingerprint on every deployment.
+    if (this.sourceStats.isDirectory()) {
+      const source = fs.realpathSync(this.sourcePath);
+      const output = fs.existsSync(this.assetOutdir)
+        ? fs.realpathSync(this.assetOutdir)
+        : path.resolve(this.assetOutdir);
+      const relativeOutput = path.relative(source, output);
+      if (relativeOutput === '') {
+        throw new ValidationError(lit`AssetSourceIsAssemblyDirectory`,
+          `Asset source ${this.sourcePath} must not be the cloud assembly output directory ${this.assetOutdir}`, this);
+      }
+      if (relativeOutput !== '..' && !relativeOutput.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeOutput)) {
+        // The current output is always unsafe. If earlier sibling directories
+        // contain cloud assemblies, exclude the common output parent as well so
+        // their stale manifests/assets cannot destabilize this asset's hash.
+        const outputParent = path.dirname(output);
+        const relativeParent = path.relative(source, outputParent);
+        const hasPriorAssembly = relativeParent && relativeParent !== '..' && !relativeParent.startsWith(`..${path.sep}`)
+          && !path.isAbsolute(relativeParent) && fs.existsSync(outputParent)
+          && fs.readdirSync(outputParent, { withFileTypes: true }).some(entry =>
+            entry.isDirectory() && entry.name !== path.basename(output)
+            && fs.existsSync(path.join(outputParent, entry.name, 'manifest.json')));
+        const excluded = (hasPriorAssembly ? relativeParent : relativeOutput).split(path.sep).join('/');
+        this.fingerprintOptions = {
+          ...this.fingerprintOptions,
+          exclude: [...this.fingerprintOptions.exclude ?? [], excluded, `${excluded}/**`],
+        };
+      }
+    }
+
+    // Symlink validation, hashing, and copying must all see the same excluded
+    // output tree (including when BLOCK_EXTERNAL follows symlinks).
+    const ignoreStrategy = IgnoreStrategy.fromCopyOptions(this.fingerprintOptions, this.sourcePath);
+    if (props.follow == SymlinkFollowMode.BLOCK_EXTERNAL && this.sourceStats.isDirectory()) {
+      validateInternalSymlinks(this.sourcePath, scope, props.follow, ignoreStrategy);
+    }
 
     // Determine the hash type based on the props as props.assetHashType is
     // optional from a caller perspective.
@@ -228,7 +261,7 @@ export class AssetStaging extends Construct {
       assetHashType: this.hashType,
       customFingerprint: this.customSourceFingerprint,
       extraHash: props.extraHash,
-      exclude: props.exclude,
+      exclude: this.fingerprintOptions.exclude,
       ignoreMode: props.ignoreMode,
       skip,
     });
